@@ -108,11 +108,30 @@ def main(query, location, job_id):
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
-                    "--window-size=1280,900",
+                    "--window-size=1000,700",
+                    # Low-memory flags for constrained containers (Streamlit Cloud
+                    # free tier). Without these, Chromium's baseline footprint can
+                    # exceed the container's memory ceiling as soon as it renders
+                    # a heavier page (e.g. a Google Maps place-detail page), and
+                    # gets killed instantly — surfaces as TargetClosedError.
+                    "--single-process",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-breakpad",
+                    "--disable-component-extensions-with-background-pages",
+                    "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+                    "--disable-ipc-flooding-protection",
+                    "--disable-renderer-backgrounding",
+                    "--force-color-profile=srgb",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--js-flags=--max-old-space-size=256",
                 ],
             )
             context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1000, "height": 700},
                 locale="en-US",
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
