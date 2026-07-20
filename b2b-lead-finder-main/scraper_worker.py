@@ -9,9 +9,17 @@ import re
 import sys
 import json
 import time
+import traceback
 import subprocess
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+
+
+def log(msg: str):
+    """Print with a timestamp, flushed immediately. app.py redirects this
+    process's stdout/stderr to logs/{job_id}.log, so this is how we get
+    real Playwright/Chromium diagnostics instead of DEVNULL swallowing them."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _mem_mb() -> str:
@@ -107,16 +115,25 @@ def main(query, location, job_id):
     results_dir.mkdir(exist_ok=True)
     job_file = results_dir / f"{job_id}.json"
 
+    log(f"=== job {job_id} start: query={query!r} location={location!r} ===")
     update_file(job_file, [], "🌐 Opening Google Maps …")
 
     # Ensure Playwright Chromium binary is downloaded (system libs come from packages.txt)
     update_file(job_file, [], "🔧 Checking browser installation …")
     try:
-        subprocess.run(
+        install = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, timeout=180
+            capture_output=True, text=True, timeout=180
         )
+        log(f"playwright install chromium -> exit={install.returncode}")
+        if install.stdout.strip():
+            log(f"playwright install stdout:\n{install.stdout}")
+        if install.stderr.strip():
+            log(f"playwright install stderr:\n{install.stderr}")
+        if install.returncode != 0:
+            update_file(job_file, [], f"⚠️ playwright install exited {install.returncode} — trying anyway …")
     except Exception as e:
+        log(f"playwright install raised: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         update_file(job_file, [], f"⚠️ Browser install warning: {e} — trying anyway …")
 
     # Build search label and URL
@@ -129,6 +146,7 @@ def main(query, location, job_id):
 
     try:
         with sync_playwright() as p:
+            log("launching chromium …")
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -159,6 +177,7 @@ def main(query, location, job_id):
                     "--disable-software-rasterizer",
                 ],
             )
+            log(f"chromium launched: connected={browser.is_connected()} version={browser.version}")
             context = browser.new_context(
                 viewport={"width": 1000, "height": 700},
                 locale="en-US",
@@ -168,6 +187,7 @@ def main(query, location, job_id):
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
             )
+            browser.on("disconnected", lambda b: log("*** browser 'disconnected' event fired ***"))
 
             # Block images/fonts/media — Streamlit Cloud's free tier has ~1GB RAM,
             # and Google Maps pages are image-heavy. Without this, headless
@@ -294,15 +314,31 @@ def main(query, location, job_id):
 
             skipped_reasons = []
             mem_before = _mem_mb()
+            crash_count = [0]  # mutable so the closure below can increment it
+
+            def _on_crash(crashed_page):
+                crash_count[0] += 1
+                log(f"*** page 'crash' event fired (crash #{crash_count[0]}) url={crashed_page.url} ***")
+
+            def _attach_diagnostics(pg):
+                pg.on("crash", _on_crash)
+                pg.on("console", lambda msg: log(f"console[{msg.type}]: {msg.text}") if msg.type == "error" else None)
+                pg.on("pageerror", lambda exc: log(f"pageerror: {exc}"))
+
+            _attach_diagnostics(page)
 
             MAX_DETAIL_PAGES = 60  # keeps memory bounded on Streamlit Cloud's free tier
             for i, place_url in enumerate(place_urls[:MAX_DETAIL_PAGES]):
                 try:
+                    log(f"[{i}] goto detail page: {place_url}")
                     page.goto(place_url, wait_until="domcontentloaded", timeout=30000)
+                    log(f"[{i}] goto succeeded, connected={browser.is_connected()}, waiting for h1 …")
 
                     try:
                         page.wait_for_selector("h1", timeout=8000)
-                    except Exception:
+                        log(f"[{i}] h1 found")
+                    except Exception as wait_exc:
+                        log(f"[{i}] wait_for_selector('h1') failed: {type(wait_exc).__name__}: {wait_exc} connected={browser.is_connected()}")
                         if len(skipped_reasons) < 3:
                             try:
                                 snippet = page.evaluate("() => document.body.innerText").strip()[:200]
@@ -398,26 +434,89 @@ def main(query, location, job_id):
                                 total=total)
 
                 except Exception as loop_exc:
-                    if len(skipped_reasons) < 3:
+                    is_target_closed = type(loop_exc).__name__ == "TargetClosedError"
+                    log(f"[{i}] EXCEPTION {type(loop_exc).__name__}: {loop_exc} connected={browser.is_connected()}\n{traceback.format_exc()}")
+                    if len(skipped_reasons) < 5:
                         skipped_reasons.append(
                             f"exception at url #{i}: {type(loop_exc).__name__}: {loop_exc} "
-                            f"[mem before-loop={mem_before} now={_mem_mb()}]"
+                            f"[crashes-so-far={crash_count[0]} mem before-loop={mem_before} now={_mem_mb()}]"
                         )
-                    # If the browser/page itself died (e.g. OOM kill), retrying
-                    # the remaining URLs against a dead page is pointless —
-                    # stop here and keep whatever leads we already collected.
-                    if type(loop_exc).__name__ == "TargetClosedError":
-                        break
+                    if is_target_closed:
+                        # The page (and possibly the whole browser) died — most
+                        # likely a renderer crash on this specific detail page.
+                        # A dead page can't be reused, so recover by creating a
+                        # fresh page (or, if the browser itself is gone, a fresh
+                        # browser) and continue with the remaining URLs instead
+                        # of abandoning the whole run over one bad page.
+                        try:
+                            if not browser.is_connected():
+                                log(f"[{i}] browser disconnected, relaunching …")
+                                browser = p.chromium.launch(
+                                    headless=True,
+                                    args=[
+                                        "--no-sandbox",
+                                        "--disable-setuid-sandbox",
+                                        "--disable-dev-shm-usage",
+                                        "--disable-gpu",
+                                        "--disable-blink-features=AutomationControlled",
+                                        "--window-size=1000,700",
+                                        "--disable-extensions",
+                                        "--disable-breakpad",
+                                        "--mute-audio",
+                                        "--disable-webgl",
+                                        "--disable-webgl2",
+                                        "--disable-3d-apis",
+                                        "--disable-accelerated-2d-canvas",
+                                        "--disable-software-rasterizer",
+                                    ],
+                                )
+                                context = browser.new_context(
+                                    viewport={"width": 1000, "height": 700},
+                                    locale="en-US",
+                                    user_agent=(
+                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/124.0.0.0 Safari/537.36"
+                                    ),
+                                )
+                                context.route(
+                                    "**/*",
+                                    lambda route: route.abort()
+                                    if route.request.resource_type in ("image", "font", "media")
+                                    else route.continue_(),
+                                )
+                                context.add_cookies([
+                                    {"name": "CONSENT", "value": "YES+cb.20231002-17-p0.en+FX+410",
+                                     "domain": ".google.com", "path": "/"},
+                                    {"name": "SOCS",    "value": "CAESEwgDEgk0NTc4MDU1NzIaAmVuIAEaBgiAv5SmBg",
+                                     "domain": ".google.com", "path": "/"},
+                                ])
+                            page = context.new_page()
+                            _attach_diagnostics(page)
+                            log(f"[{i}] recovery complete, new page created, connected={browser.is_connected()}")
+                        except Exception as recover_exc:
+                            log(f"[{i}] RECOVERY FAILED: {type(recover_exc).__name__}: {recover_exc}\n{traceback.format_exc()}")
+                            if len(skipped_reasons) < 5:
+                                skipped_reasons.append(
+                                    f"recovery failed after url #{i}: {type(recover_exc).__name__}: {recover_exc}"
+                                )
+                            break
                     continue
 
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     except Exception as e:
+        log(f"TOP-LEVEL EXCEPTION: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         # Write the actual error to the job file so we can see it in the UI
         update_file(job_file, leads,
                     f"❌ Scraper error: {e}",
                     status="done", total=len(leads))
         return
+
+    log(f"=== job {job_id} done: {len(leads)} leads ===")
 
     if leads:
         final_msg = f"✅ Done! Found {len(leads)} leads."

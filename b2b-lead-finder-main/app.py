@@ -4,6 +4,7 @@ B2B Lead Finder – Streamlit App
 Run:  streamlit run app.py
 """
 
+import os
 import sys
 import uuid
 import json
@@ -29,6 +30,7 @@ _install_playwright_browser()
 # ─── Config ───────────────────────────────────────────────────────────────────
 HISTORY_FILE = Path(__file__).parent / "history.json"
 RESULTS_DIR  = Path(__file__).parent / "results"
+LOG_DIR      = Path(__file__).parent / "logs"
 
 LOCATIONS = {
     "Singapore": [
@@ -209,6 +211,7 @@ for k, v in {
     "total"     : 0,
     "ai_feed"   : [],
     "last_n"    : 0,
+    "log_path"  : None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -268,6 +271,28 @@ status_ph   = st.empty()
 progress_ph = st.empty()
 table_ph    = st.empty()
 
+def _render_log_viewer():
+    """Show the raw Chromium/Playwright/Python log for the last run, if any."""
+    lp = st.session_state.get("log_path")
+    if not lp:
+        return
+    log_file = Path(lp)
+    if not log_file.exists():
+        return
+    with st.expander("🪵 Scraper log (Python + Playwright + Chromium stderr)", expanded=False):
+        try:
+            content = log_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            content = f"(could not read log: {e})"
+        st.text_area("log", content[-20000:], height=300, label_visibility="collapsed")
+        st.download_button(
+            "⬇️ Download full log",
+            data=content,
+            file_name=log_file.name,
+            mime="text/plain",
+            key=f"dl_{log_file.name}",
+        )
+
 # ── Stop ──────────────────────────────────────────────────────────────────────
 if stop_btn and st.session_state.running:
     if st.session_state.proc_pid:
@@ -287,13 +312,19 @@ if stop_btn and st.session_state.running:
 if start_btn and query and not st.session_state.running:
     job_id = str(uuid.uuid4())
     RESULTS_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
+
+    log_path = LOG_DIR / f"{job_id}.log"
+    log_fh = open(log_path, "w", encoding="utf-8")
 
     worker = Path(__file__).parent / "scraper_worker.py"
     proc = subprocess.Popen(
-        [sys.executable, str(worker), query, location, job_id],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        [sys.executable, "-u", str(worker), query, location, job_id],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "DEBUG": "pw:browser"},
     )
+    log_fh.close()  # child keeps its own fd; safe to close our handle
 
     st.session_state.leads    = []
     st.session_state.job_id   = job_id
@@ -302,6 +333,7 @@ if start_btn and query and not st.session_state.running:
     st.session_state.status   = "🌐 Starting scraper …"
     st.session_state.total    = 80
     st.session_state.last_n   = 0
+    st.session_state.log_path = str(log_path)
 
     ai_msg(f"🔍 Starting search for **{query}** in **{location}**. Opening Google Maps and waiting for results…")
     st.rerun()
@@ -374,6 +406,8 @@ if st.session_state.running and st.session_state.job_id:
                 },
             )
 
+        _render_log_viewer()
+
         if not done:
             time.sleep(2)
             st.rerun()
@@ -382,6 +416,7 @@ if st.session_state.running and st.session_state.job_id:
 elif st.session_state.leads and not st.session_state.running:
     if st.session_state.status:
         status_ph.info(st.session_state.status)
+    _render_log_viewer()
 
     df = pd.DataFrame(st.session_state.leads)
 
