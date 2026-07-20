@@ -121,6 +121,17 @@ def main(query, location, job_id):
                 ),
             )
 
+            # Block images/fonts/media — Streamlit Cloud's free tier has ~1GB RAM,
+            # and Google Maps pages are image-heavy. Without this, headless
+            # Chromium gets OOM-killed partway through the detail-page loop,
+            # which shows up as a silent "0 leads" with no error in the UI.
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "font", "media")
+                else route.continue_(),
+            )
+
             # Bypass Google consent wall
             context.add_cookies([
                 {"name": "CONSENT", "value": "YES+cb.20231002-17-p0.en+FX+410",
@@ -235,7 +246,8 @@ def main(query, location, job_id):
 
             skipped_reasons = []
 
-            for place_url in place_urls[:120]:
+            MAX_DETAIL_PAGES = 60  # keeps memory bounded on Streamlit Cloud's free tier
+            for place_url in place_urls[:MAX_DETAIL_PAGES]:
                 try:
                     page.goto(place_url, wait_until="domcontentloaded", timeout=30000)
 
@@ -339,6 +351,11 @@ def main(query, location, job_id):
                 except Exception as loop_exc:
                     if len(skipped_reasons) < 3:
                         skipped_reasons.append(f"exception: {type(loop_exc).__name__}: {loop_exc}")
+                    # If the browser/page itself died (e.g. OOM kill), retrying
+                    # the remaining URLs against a dead page is pointless —
+                    # stop here and keep whatever leads we already collected.
+                    if type(loop_exc).__name__ == "TargetClosedError":
+                        break
                     continue
 
             browser.close()
