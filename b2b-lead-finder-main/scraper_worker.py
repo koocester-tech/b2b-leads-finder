@@ -233,6 +233,8 @@ def main(query, location, job_id):
                 browser.close()
                 return
 
+            skipped_reasons = []
+
             for place_url in place_urls[:120]:
                 try:
                     page.goto(place_url, wait_until="domcontentloaded", timeout=30000)
@@ -240,6 +242,12 @@ def main(query, location, job_id):
                     try:
                         page.wait_for_selector("h1", timeout=8000)
                     except Exception:
+                        if len(skipped_reasons) < 3:
+                            try:
+                                snippet = page.evaluate("() => document.body.innerText").strip()[:200]
+                            except Exception:
+                                snippet = "(could not read page)"
+                            skipped_reasons.append(f"title='{page.title()}' text='{snippet}'")
                         continue
 
                     # Name
@@ -332,9 +340,14 @@ def main(query, location, job_id):
                     status="done", total=len(leads))
         return
 
-    update_file(job_file, leads,
-                f"✅ Done! Found {len(leads)} leads.",
-                status="done", total=total)
+    if leads:
+        final_msg = f"✅ Done! Found {len(leads)} leads."
+    elif skipped_reasons:
+        final_msg = f"❌ Done. Found 0 leads. Sample failures: {' || '.join(skipped_reasons)}"
+    else:
+        final_msg = "✅ Done! Found 0 leads."
+
+    update_file(job_file, leads, final_msg, status="done", total=total)
 
 
 if __name__ == "__main__":
