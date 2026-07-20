@@ -258,7 +258,15 @@ def main(query, location, job_id):
                             name = (el.inner_text() or "").strip()
                             if name:
                                 break
-                    if not name or name in seen:
+                    if not name:
+                        if len(skipped_reasons) < 3:
+                            try:
+                                snippet = page.evaluate("() => document.body.innerText").strip()[:200]
+                            except Exception:
+                                snippet = "(could not read page)"
+                            skipped_reasons.append(f"empty-name title='{page.title()}' text='{snippet}'")
+                        continue
+                    if name in seen:
                         continue
                     seen.add(name)
 
@@ -328,7 +336,9 @@ def main(query, location, job_id):
                                 f"⚡ Found {len(leads)} leads so far …",
                                 total=total)
 
-                except Exception:
+                except Exception as loop_exc:
+                    if len(skipped_reasons) < 3:
+                        skipped_reasons.append(f"exception: {type(loop_exc).__name__}: {loop_exc}")
                     continue
 
             browser.close()
