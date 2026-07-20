@@ -138,25 +138,25 @@ def main(query, location, job_id):
                     "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
                     "--window-size=1000,700",
-                    # Low-memory flags for constrained containers (Streamlit Cloud
-                    # free tier). Without these, Chromium's baseline footprint can
-                    # exceed the container's memory ceiling as soon as it renders
-                    # a heavier page (e.g. a Google Maps place-detail page), and
-                    # gets killed instantly — surfaces as TargetClosedError.
-                    "--single-process",
+                    # NOTE: memory pressure was ruled out empirically (96GB free
+                    # at crash time), so the aggressive low-memory flags and
+                    # --single-process from that theory have been removed.
+                    # --single-process was actively harmful: it merges the
+                    # browser and renderer into one OS process, so a renderer
+                    # crash (e.g. from WebGL) takes the whole browser down
+                    # instead of just the tab — which matches the observed
+                    # TargetClosedError. Google Maps place-detail pages render
+                    # an embedded interactive map via WebGL; headless Chromium's
+                    # software GL rendering is a known crash source. We only
+                    # need text data, so disable GPU/WebGL rendering entirely.
                     "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
                     "--disable-breakpad",
-                    "--disable-component-extensions-with-background-pages",
-                    "--disable-features=TranslateUI,BlinkGenPropertyTrees",
-                    "--disable-ipc-flooding-protection",
-                    "--disable-renderer-backgrounding",
-                    "--force-color-profile=srgb",
-                    "--metrics-recording-only",
                     "--mute-audio",
-                    "--js-flags=--max-old-space-size=256",
+                    "--disable-webgl",
+                    "--disable-webgl2",
+                    "--disable-3d-apis",
+                    "--disable-accelerated-2d-canvas",
+                    "--disable-software-rasterizer",
                 ],
             )
             context = browser.new_context(
