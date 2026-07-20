@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Scraper output — don't commit job results or search history
+results/
+history.json
+
+# OS
+.DS_Store
+Thumbs.db
