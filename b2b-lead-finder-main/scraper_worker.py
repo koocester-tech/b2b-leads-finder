@@ -4,6 +4,7 @@ Called by app.py via subprocess. Also works standalone:
   python scraper_worker.py "interior designers" "Kuala Lumpur" JOB_ID
 """
 
+import os
 import re
 import sys
 import json
@@ -11,6 +12,34 @@ import time
 import subprocess
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+
+
+def _mem_mb() -> str:
+    """Read this process's RSS and the container's total available memory,
+    for diagnosing whether crashes correlate with memory pressure. The
+    Chromium browser is a separate process from this Python worker, so
+    system-wide MemAvailable (not just our own RSS) is what actually matters
+    for whether the OS/container OOM-kills something. Linux-only; returns
+    '?' if unavailable (e.g. non-Linux dev environment)."""
+    rss = "?"
+    avail = "?"
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = f"{int(line.split()[1]) / 1024:.0f}MB"
+                    break
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = f"{int(line.split()[1]) / 1024:.0f}MB"
+                    break
+    except Exception:
+        pass
+    return f"pyRSS={rss} sysAvail={avail}"
 
 # ─── Location metadata ────────────────────────────────────────────────────────
 LOCATION_META = {
@@ -264,9 +293,10 @@ def main(query, location, job_id):
                 return
 
             skipped_reasons = []
+            mem_before = _mem_mb()
 
             MAX_DETAIL_PAGES = 60  # keeps memory bounded on Streamlit Cloud's free tier
-            for place_url in place_urls[:MAX_DETAIL_PAGES]:
+            for i, place_url in enumerate(place_urls[:MAX_DETAIL_PAGES]):
                 try:
                     page.goto(place_url, wait_until="domcontentloaded", timeout=30000)
 
@@ -369,7 +399,10 @@ def main(query, location, job_id):
 
                 except Exception as loop_exc:
                     if len(skipped_reasons) < 3:
-                        skipped_reasons.append(f"exception: {type(loop_exc).__name__}: {loop_exc}")
+                        skipped_reasons.append(
+                            f"exception at url #{i}: {type(loop_exc).__name__}: {loop_exc} "
+                            f"[mem before-loop={mem_before} now={_mem_mb()}]"
+                        )
                     # If the browser/page itself died (e.g. OOM kill), retrying
                     # the remaining URLs against a dead page is pointless —
                     # stop here and keep whatever leads we already collected.
